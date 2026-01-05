@@ -1,4 +1,3 @@
-package grpcclients
 package grpcclients_test
 
 import (
