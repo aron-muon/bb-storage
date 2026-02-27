@@ -243,6 +243,68 @@ func TestBoundedZstdPool_NilRelease(t *testing.T) {
 	pool.ReleaseDecoder(nil)
 }
 
+func TestDefaultZstdPoolConfig(t *testing.T) {
+	config := grpcclients.DefaultZstdPoolConfig()
+
+	require.Equal(t, int64(grpcclients.DefaultMaxConcurrentEncoders), config.MaxConcurrentEncoders)
+	require.Equal(t, int64(grpcclients.DefaultMaxConcurrentDecoders), config.MaxConcurrentDecoders)
+	require.Equal(t, int64(grpcclients.DefaultCompressionThreshold), config.CompressionThreshold)
+	require.Equal(t, grpcclients.DefaultEncoderWindowSize, config.EncoderWindowSize)
+	require.Equal(t, grpcclients.DefaultDecoderMaxWindow, config.DecoderMaxWindow)
+}
+
+func TestEstimateMaxMemoryUsage(t *testing.T) {
+	config := grpcclients.DefaultZstdPoolConfig()
+	expected := int64(grpcclients.DefaultMaxConcurrentEncoders)*int64(grpcclients.DefaultEncoderWindowSize) +
+		int64(grpcclients.DefaultMaxConcurrentDecoders)*int64(grpcclients.DefaultDecoderMaxWindow)
+	require.Equal(t, expected, config.EstimateMaxMemoryUsage())
+
+	// ~320MB: 16*4MB + 32*8MB = 64MB + 256MB
+	require.Equal(t, int64(320*1024*1024), config.EstimateMaxMemoryUsage())
+}
+
+func TestConfigFromMemoryBudget(t *testing.T) {
+	// 512MB budget: 30% encoders (153MB / 4MB = 38), 70% decoders (358MB / 8MB = 44)
+	config := grpcclients.ConfigFromMemoryBudget(512 * 1024 * 1024)
+	require.Equal(t, int64(38), config.MaxConcurrentEncoders)
+	require.Equal(t, int64(44), config.MaxConcurrentDecoders)
+
+	// Very small budget: should floor to 1 each
+	config = grpcclients.ConfigFromMemoryBudget(1)
+	require.Equal(t, int64(1), config.MaxConcurrentEncoders)
+	require.Equal(t, int64(1), config.MaxConcurrentDecoders)
+}
+
+func TestParseEncoderLevel(t *testing.T) {
+	require.Equal(t, grpcclients.ParseEncoderLevel("fastest"), grpcclients.ParseEncoderLevel("fastest"))
+	require.Equal(t, grpcclients.ParseEncoderLevel("default"), grpcclients.ParseEncoderLevel(""))
+	require.Equal(t, grpcclients.ParseEncoderLevel("default"), grpcclients.ParseEncoderLevel("unknown_value"))
+
+	// Verify all valid levels produce distinct values
+	levels := map[string]bool{}
+	for _, name := range []string{"fastest", "default", "better", "best"} {
+		level := grpcclients.ParseEncoderLevel(name)
+		key := string(rune(level))
+		require.False(t, levels[key], "duplicate level for %q", name)
+		levels[key] = true
+	}
+}
+
+func TestZstdPoolConfigNewPool(t *testing.T) {
+	config := grpcclients.DefaultZstdPoolConfig()
+	pool := config.NewPool()
+	require.NotNil(t, pool)
+
+	// Verify the pool is functional
+	var buf bytes.Buffer
+	enc, err := pool.AcquireEncoder(context.Background(), &buf)
+	require.NoError(t, err)
+	_, err = enc.Write([]byte("test"))
+	require.NoError(t, err)
+	require.NoError(t, enc.Close())
+	pool.ReleaseEncoder(enc)
+}
+
 func BenchmarkBoundedZstdPool_AcquireRelease(b *testing.B) {
 	pool := grpcclients.NewBoundedZstdPool(16, 16, nil, nil)
 	testData := bytes.Repeat([]byte("benchmark data "), 1000)

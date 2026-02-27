@@ -3,7 +3,9 @@ package grpcclients_test
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
+	"time"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/bazelbuild/remote-apis/build/bazel/semver"
@@ -371,28 +373,9 @@ func TestCASBlobAccessPutWithCompression(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-
-	// Use compression threshold of 100 bytes to match the hardcoded value
 	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, true)
 
-	// Set up GetCapabilities to return ZSTD support
-	client.EXPECT().Invoke(
-		gomock.Any(),
-		"/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
-		gomock.Any(),
-		gomock.Any(),
-		gomock.Any(),
-	).DoAndReturn(func(ctx context.Context, method string, args, reply interface{}, opts ...grpc.CallOption) error {
-		proto.Merge(reply.(proto.Message), &remoteexecution.ServerCapabilities{
-			CacheCapabilities: &remoteexecution.CacheCapabilities{
-				DigestFunctions: digest.SupportedDigestFunctions,
-				SupportedCompressors: []remoteexecution.Compressor_Value{
-					remoteexecution.Compressor_ZSTD,
-				},
-			},
-		})
-		return nil
-	}).AnyTimes()
+	expectGetCapabilitiesWithZSTD(client)
 
 	blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "1411ffd5854fa029dc4d231aa89311eb", 1000)
 	testUUID := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
@@ -442,14 +425,8 @@ func TestCASBlobAccessPutWithCompression(t *testing.T) {
 	})
 }
 
-func TestCASBlobAccessGetWithCompression(t *testing.T) {
-	ctrl, ctx := gomock.WithContext(context.Background(), t)
-
-	client := mock.NewMockClientConnInterface(ctrl)
-	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 100, true)
-
-	// Set up GetCapabilities to return ZSTD support
+// expectGetCapabilitiesWithZSTD sets up a mock to return ZSTD in SupportedCompressors.
+func expectGetCapabilitiesWithZSTD(client *mock.MockClientConnInterface) {
 	client.EXPECT().Invoke(
 		gomock.Any(),
 		"/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
@@ -467,6 +444,16 @@ func TestCASBlobAccessGetWithCompression(t *testing.T) {
 		})
 		return nil
 	}).AnyTimes()
+}
+
+func TestCASBlobAccessGetWithCompression(t *testing.T) {
+	ctrl, ctx := gomock.WithContext(context.Background(), t)
+
+	client := mock.NewMockClientConnInterface(ctrl)
+	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 100, true)
+
+	expectGetCapabilitiesWithZSTD(client)
 
 	t.Run("SuccessWithCompression", func(t *testing.T) {
 		expectedData := make([]byte, 1000)
@@ -503,4 +490,166 @@ func TestCASBlobAccessGetWithCompression(t *testing.T) {
 		require.Equal(t, expectedData, data)
 	})
 
+}
+
+func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
+	// Create a pool with only 1 concurrent encoder to test backpressure.
+	pool := grpcclients.NewBoundedZstdPool(1, 1, nil, nil)
+
+	ctrl, ctx := gomock.WithContext(context.Background(), t)
+	client := mock.NewMockClientConnInterface(ctrl)
+	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
+	blobAccess := grpcclients.NewCASBlobAccessWithPool(client, uuidGenerator.Call, 10, true, pool)
+
+	expectGetCapabilitiesWithZSTD(client)
+
+	largeData := make([]byte, 1000)
+	for i := range largeData {
+		largeData[i] = byte('A' + (i % 26))
+	}
+	blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "1411ffd5854fa029dc4d231aa89311eb", 1000)
+	testUUID := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
+
+	// Hold the only encoder slot by starting a Put that blocks on SendMsg.
+	sendBlocked := make(chan struct{})
+	sendUnblock := make(chan struct{})
+
+	clientStream1 := mock.NewMockClientStream(ctrl)
+	uuidGenerator.EXPECT().Call().Return(testUUID, nil)
+	client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").
+		Return(clientStream1, nil)
+	r1 := mock.NewMockFileReader(ctrl)
+	r1.EXPECT().ReadAt(gomock.Len(1000), int64(0)).DoAndReturn(func(p []byte, off int64) (int, error) {
+		copy(p, largeData)
+		return 1000, nil
+	})
+	r1.EXPECT().Close()
+
+	// First SendMsg blocks, holding the encoder slot.
+	clientStream1.EXPECT().SendMsg(gomock.Any()).DoAndReturn(func(msg interface{}) error {
+		close(sendBlocked)
+		<-sendUnblock
+		return nil
+	})
+	clientStream1.EXPECT().SendMsg(gomock.Any()).Return(nil) // FinishWrite
+	clientStream1.EXPECT().CloseSend().Return(nil)
+	clientStream1.EXPECT().RecvMsg(gomock.Any()).Return(nil)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := blobAccess.Put(ctx, blobDigest, buffer.NewValidatedBufferFromReaderAt(r1, 1000))
+		require.NoError(t, err)
+	}()
+
+	// Wait for the first Put to acquire the encoder and block on SendMsg.
+	<-sendBlocked
+
+	// Second Put should fail because the pool is exhausted and the context expires.
+	shortCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+
+	r2 := mock.NewMockFileReader(ctrl)
+	r2.EXPECT().Close()
+
+	// This Put needs a new stream — but it will fail before using it because
+	// AcquireEncoder blocks and the context times out.
+	clientStream2 := mock.NewMockClientStream(ctrl)
+	uuidGenerator.EXPECT().Call().Return(testUUID, nil)
+	client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").
+		Return(clientStream2, nil)
+	clientStream2.EXPECT().CloseSend().Return(nil).AnyTimes()
+	clientStream2.EXPECT().RecvMsg(gomock.Any()).Return(nil).AnyTimes()
+
+	err := blobAccess.Put(shortCtx, blobDigest, buffer.NewValidatedBufferFromReaderAt(r2, 1000))
+	require.Error(t, err)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+
+	// Unblock the first Put so it can complete.
+	close(sendUnblock)
+	wg.Wait()
+}
+
+func TestCASBlobAccessPutPoolReleasesEncoder(t *testing.T) {
+	// Pool with 1 encoder: if encoder isn't released after the first Put,
+	// the second Put would deadlock.
+	pool := grpcclients.NewBoundedZstdPool(1, 1, nil, nil)
+
+	ctrl, ctx := gomock.WithContext(context.Background(), t)
+	client := mock.NewMockClientConnInterface(ctrl)
+	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
+	blobAccess := grpcclients.NewCASBlobAccessWithPool(client, uuidGenerator.Call, 10, true, pool)
+
+	expectGetCapabilitiesWithZSTD(client)
+
+	largeData := make([]byte, 1000)
+	for i := range largeData {
+		largeData[i] = byte('A' + (i % 26))
+	}
+	blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "1411ffd5854fa029dc4d231aa89311eb", 1000)
+	testUUID := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
+
+	// Do two sequential Puts, both must succeed with pool size 1.
+	for i := 0; i < 2; i++ {
+		clientStream := mock.NewMockClientStream(ctrl)
+		uuidGenerator.EXPECT().Call().Return(testUUID, nil)
+		client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").
+			Return(clientStream, nil)
+		r := mock.NewMockFileReader(ctrl)
+		r.EXPECT().ReadAt(gomock.Len(1000), int64(0)).DoAndReturn(func(p []byte, off int64) (int, error) {
+			copy(p, largeData)
+			return 1000, nil
+		})
+		r.EXPECT().Close()
+		clientStream.EXPECT().SendMsg(gomock.Any()).Return(nil).Times(2) // data + finish
+		clientStream.EXPECT().CloseSend().Return(nil)
+		clientStream.EXPECT().RecvMsg(gomock.Any()).Return(nil)
+
+		err := blobAccess.Put(ctx, blobDigest, buffer.NewValidatedBufferFromReaderAt(r, 1000))
+		require.NoError(t, err, "Put #%d should succeed", i+1)
+	}
+}
+
+func TestCASBlobAccessGetPoolReleasesDecoder(t *testing.T) {
+	// Pool with 1 decoder: if decoder isn't released after the first Get,
+	// the second Get would deadlock.
+	pool := grpcclients.NewBoundedZstdPool(1, 1, nil, nil)
+
+	ctrl, ctx := gomock.WithContext(context.Background(), t)
+	client := mock.NewMockClientConnInterface(ctrl)
+	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
+	blobAccess := grpcclients.NewCASBlobAccessWithPool(client, uuidGenerator.Call, 100, true, pool)
+
+	expectGetCapabilitiesWithZSTD(client)
+
+	expectedData := make([]byte, 1000)
+	for i := range expectedData {
+		expectedData[i] = byte('A' + (i % 26))
+	}
+	largeDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "1411ffd5854fa029dc4d231aa89311eb", 1000)
+
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+	require.NoError(t, err)
+	compressedData := encoder.EncodeAll(expectedData, nil)
+
+	// Do two sequential Gets, both must succeed with pool size 1.
+	for i := 0; i < 2; i++ {
+		clientStream := mock.NewMockClientStream(ctrl)
+		client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Read").
+			Return(clientStream, nil)
+		clientStream.EXPECT().SendMsg(gomock.Any()).Return(nil)
+		clientStream.EXPECT().RecvMsg(gomock.Any()).DoAndReturn(func(m interface{}) error {
+			resp := m.(*bytestream.ReadResponse)
+			resp.Data = compressedData
+			return nil
+		})
+		clientStream.EXPECT().RecvMsg(gomock.Any()).Return(io.EOF).AnyTimes()
+		clientStream.EXPECT().CloseSend().Return(nil)
+
+		buf := blobAccess.Get(ctx, largeDigest)
+		data, err := buf.ToByteSlice(1500)
+		require.NoError(t, err, "Get #%d should succeed", i+1)
+		require.Equal(t, expectedData, data)
+	}
 }
