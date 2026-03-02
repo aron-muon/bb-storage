@@ -2,7 +2,11 @@ package grpcclients
 
 import (
 	"context"
+	"errors"
 	"io"
+	"slices"
+	"sync"
+	"sync/atomic"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
@@ -14,7 +18,9 @@ import (
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type casBlobAccess struct {
@@ -23,20 +29,29 @@ type casBlobAccess struct {
 	capabilitiesClient              remoteexecution.CapabilitiesClient
 	uuidGenerator                   util.UUIDGenerator
 	readChunkSize                   int
+	enableZSTDCompression           bool
+	supportedCompressors            atomic.Pointer[[]remoteexecution.Compressor_Value]
+	zstdPool                        *BoundedZstdPool
 }
 
 // NewCASBlobAccess creates a BlobAccess handle that relays any requests
-// to a GRPC service that implements the bytestream.ByteStream and
+// to a gRPC service that implements the bytestream.ByteStream and
 // remoteexecution.ContentAddressableStorage services. Those are the
 // services that Bazel uses to access blobs stored in the Content
 // Addressable Storage.
-func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int) blobstore.BlobAccess {
+//
+// If enableZSTDCompression is true, the client will use ZSTD compression
+// for ByteStream operations if the server supports it. In that case,
+// zstdPool must be provided for pooling encoders/decoders.
+func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int, enableZSTDCompression bool, zstdPool *BoundedZstdPool) blobstore.BlobAccess {
 	return &casBlobAccess{
 		byteStreamClient:                bytestream.NewByteStreamClient(client),
 		contentAddressableStorageClient: remoteexecution.NewContentAddressableStorageClient(client),
 		capabilitiesClient:              remoteexecution.NewCapabilitiesClient(client),
 		uuidGenerator:                   uuidGenerator,
 		readChunkSize:                   readChunkSize,
+		enableZSTDCompression:           enableZSTDCompression,
+		zstdPool:                        zstdPool,
 	}
 }
 
@@ -62,11 +77,165 @@ func (r *byteStreamChunkReader) Close() {
 	}
 }
 
+// zstdByteStreamChunkReader reads compressed data from gRPC stream and decompresses using pooled decoder.
+type zstdByteStreamChunkReader struct {
+	client        bytestream.ByteStream_ReadClient
+	cancel        context.CancelFunc
+	pool          *BoundedZstdPool
+	decoder       *DecoderWrapper
+	pipeReader    *io.PipeReader
+	pipeWriter    *io.PipeWriter
+	readChunkSize int
+	wg            sync.WaitGroup
+	initOnce      sync.Once
+	initErr       error
+}
+
+func (r *zstdByteStreamChunkReader) init(ctx context.Context) error {
+	r.initOnce.Do(func() {
+		r.pipeReader, r.pipeWriter = io.Pipe()
+
+		// Start goroutine to read from gRPC and write to pipe
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			defer r.pipeWriter.Close()
+			for {
+				chunk, err := r.client.Recv()
+				if err != nil {
+					if err != io.EOF {
+						r.pipeWriter.CloseWithError(err)
+					}
+					return
+				}
+				if _, writeErr := r.pipeWriter.Write(chunk.Data); writeErr != nil {
+					r.pipeWriter.CloseWithError(writeErr)
+					return
+				}
+			}
+		}()
+
+		// Acquire decoder from pool (blocking if at capacity)
+		r.decoder, r.initErr = r.pool.AcquireDecoder(ctx, r.pipeReader)
+		if r.initErr != nil {
+			r.pipeReader.CloseWithError(r.initErr)
+		}
+	})
+	return r.initErr
+}
+
+func (r *zstdByteStreamChunkReader) Read() ([]byte, error) {
+	// Lazy initialization on first read. We use context.Background() here
+	// because the buffer.ChunkReader interface does not propagate a context.
+	// This means decoder pool acquisition on the read path cannot be
+	// cancelled by the original request context. The pool's semaphore will
+	// still bound concurrency; the caller can cancel by closing the reader.
+	if err := r.init(context.Background()); err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, r.readChunkSize)
+	n, err := r.decoder.Read(buf)
+	if n > 0 {
+		if err != nil && err != io.EOF {
+			err = nil
+		}
+		return buf[:n], err
+	}
+	return nil, err
+}
+
+func (r *zstdByteStreamChunkReader) Close() {
+	// Release decoder back to pool
+	if r.decoder != nil {
+		r.pool.ReleaseDecoder(r.decoder)
+		r.decoder = nil
+	}
+
+	if r.pipeReader != nil {
+		r.pipeReader.Close()
+	}
+
+	r.cancel()
+
+	// Drain the gRPC stream
+	for {
+		if _, err := r.client.Recv(); err != nil {
+			break
+		}
+	}
+	r.wg.Wait()
+}
+
+type zstdByteStreamWriter struct {
+	client       bytestream.ByteStream_WriteClient
+	resourceName string
+	writeOffset  int64
+	cancel       context.CancelFunc
+}
+
+func (w *zstdByteStreamWriter) Write(p []byte) (int, error) {
+	if err := w.client.Send(&bytestream.WriteRequest{
+		ResourceName: w.resourceName,
+		WriteOffset:  w.writeOffset,
+		Data:         p,
+	}); err != nil {
+		return 0, err
+	}
+	w.writeOffset += int64(len(p))
+	w.resourceName = ""
+	return len(p), nil
+}
+
+func (w *zstdByteStreamWriter) Close() error {
+	if err := w.client.Send(&bytestream.WriteRequest{
+		ResourceName: w.resourceName,
+		WriteOffset:  w.writeOffset,
+		FinishWrite:  true,
+	}); err != nil {
+		w.cancel()
+		w.client.CloseAndRecv()
+		return err
+	}
+	_, err := w.client.CloseAndRecv()
+	w.cancel()
+	return err
+}
+
 const resourceNameHeader = "build.bazel.remote.execution.v2.resource-name"
 
+// shouldUseZSTDCompression checks if ZSTD compression should be used.
+// It ensures GetCapabilities has been called to negotiate compression support.
+func (ba *casBlobAccess) shouldUseZSTDCompression(ctx context.Context, digest digest.Digest) (bool, error) {
+	if !ba.enableZSTDCompression {
+		return false, nil
+	}
+
+	supportedCompressors := ba.supportedCompressors.Load()
+	if supportedCompressors == nil {
+		// Call GetCapabilities to check server support.
+		if _, err := ba.GetCapabilities(ctx, digest.GetDigestFunction().GetInstanceName()); err != nil {
+			return false, err
+		}
+		supportedCompressors = ba.supportedCompressors.Load()
+	}
+
+	return slices.Contains(*supportedCompressors, remoteexecution.Compressor_ZSTD), nil
+}
+
 func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.Buffer {
+	useCompression, err := ba.shouldUseZSTDCompression(ctx, digest)
+	if err != nil {
+		return buffer.NewBufferFromError(err)
+	}
+
+	compressor := remoteexecution.Compressor_IDENTITY
+	if useCompression {
+		compressor = remoteexecution.Compressor_ZSTD
+	}
+
 	ctxWithCancel, cancel := context.WithCancel(ctx)
-	resourceName := digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY)
+	resourceName := digest.GetByteStreamReadPath(compressor)
 	client, err := ba.byteStreamClient.Read(
 		metadata.AppendToOutgoingContext(ctxWithCancel, resourceNameHeader, resourceName),
 		&bytestream.ReadRequest{
@@ -77,6 +246,16 @@ func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.B
 		cancel()
 		return buffer.NewBufferFromError(err)
 	}
+
+	if useCompression {
+		return buffer.NewCASBufferFromChunkReader(digest, &zstdByteStreamChunkReader{
+			client:        client,
+			cancel:        cancel,
+			pool:          ba.zstdPool,
+			readChunkSize: ba.readChunkSize,
+		}, buffer.BackendProvided(buffer.Irreparable(digest)))
+	}
+
 	return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
 		client: client,
 		cancel: cancel,
@@ -89,18 +268,73 @@ func (ba *casBlobAccess) GetFromComposite(ctx context.Context, parentDigest, chi
 }
 
 func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer.Buffer) error {
-	r := b.ToChunkReader(0, ba.readChunkSize)
-	defer r.Close()
+	useCompression, err := ba.shouldUseZSTDCompression(ctx, digest)
+	if err != nil {
+		b.Discard()
+		return err
+	}
+
+	compressor := remoteexecution.Compressor_IDENTITY
+	if useCompression {
+		compressor = remoteexecution.Compressor_ZSTD
+	}
 
 	ctxWithCancel, cancel := context.WithCancel(ctx)
-	resourceName := digest.GetByteStreamWritePath(uuid.Must(ba.uuidGenerator()), remoteexecution.Compressor_IDENTITY)
+	resourceName := digest.GetByteStreamWritePath(uuid.Must(ba.uuidGenerator()), compressor)
 	client, err := ba.byteStreamClient.Write(
 		metadata.AppendToOutgoingContext(ctxWithCancel, resourceNameHeader, resourceName),
 	)
 	if err != nil {
 		cancel()
+		b.Discard()
 		return err
 	}
+
+	if useCompression {
+		byteStreamWriter := &zstdByteStreamWriter{
+			client:       client,
+			resourceName: resourceName,
+			writeOffset:  0,
+			cancel:       cancel,
+		}
+
+		// Acquire encoder from pool (blocks if at capacity - provides backpressure)
+		encoder, err := ba.zstdPool.AcquireEncoder(ctx, byteStreamWriter)
+		if err != nil {
+			cancel()
+			b.Discard()
+			if _, closeErr := client.CloseAndRecv(); closeErr != nil {
+				return status.Errorf(codes.Internal, "Failed to close client: %v and acquire encoder: %v", closeErr, err)
+			}
+			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
+		}
+
+		// Ensure encoder is returned to pool
+		defer ba.zstdPool.ReleaseEncoder(encoder)
+
+		if err := b.IntoWriter(encoder.Encoder); err != nil {
+			if zstdCloseErr := encoder.Close(); zstdCloseErr != nil {
+				err = errors.Join(err, zstdCloseErr)
+			}
+			if closeErr := byteStreamWriter.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+			return err
+		}
+
+		if err := encoder.Close(); err != nil {
+			if closeErr := byteStreamWriter.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+			return err
+		}
+
+		return byteStreamWriter.Close()
+	}
+
+	// Non-compressed path
+	r := b.ToChunkReader(0, ba.readChunkSize)
+	defer r.Close()
 
 	writeOffset := int64(0)
 	for {
@@ -140,6 +374,10 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 }
 
 func (ba *casBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (digest.Set, error) {
+	return findMissingBlobsInternal(ctx, digests, ba.contentAddressableStorageClient)
+}
+
+func findMissingBlobsInternal(ctx context.Context, digests digest.Set, cas remoteexecution.ContentAddressableStorageClient) (digest.Set, error) {
 	// Partition all digests by digest function, as the
 	// FindMissingBlobs() RPC can only process digests for a single
 	// instance name and digest function.
@@ -157,7 +395,7 @@ func (ba *casBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (d
 			BlobDigests:    blobDigests,
 			DigestFunction: digestFunction.GetEnumValue(),
 		}
-		response, err := ba.contentAddressableStorageClient.FindMissingBlobs(ctx, &request)
+		response, err := cas.FindMissingBlobs(ctx, &request)
 		if err != nil {
 			return digest.EmptySet, err
 		}
@@ -180,11 +418,14 @@ func (ba *casBlobAccess) GetCapabilities(ctx context.Context, instanceName diges
 		return nil, err
 	}
 
+	cacheCapabilities := serverCapabilities.CacheCapabilities
+
+	// Store supported compressors for compression negotiation.
+	ba.supportedCompressors.Store(&cacheCapabilities.SupportedCompressors)
+
 	// Only return fields that pertain to the Content Addressable
 	// Storage. Don't set 'max_batch_total_size_bytes', as we don't
-	// issue batch operations. The same holds for fields related to
-	// compression support.
-	cacheCapabilities := serverCapabilities.CacheCapabilities
+	// issue batch operations.
 	return &remoteexecution.ServerCapabilities{
 		CacheCapabilities: &remoteexecution.CacheCapabilities{
 			DigestFunctions: digest.RemoveUnsupportedDigestFunctions(cacheCapabilities.DigestFunctions),
