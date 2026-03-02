@@ -497,7 +497,6 @@ func TestCASBlobAccessGetWithCompression(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, expectedData, data)
 	})
-
 }
 
 func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
