@@ -10,6 +10,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/grpcclients"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/local"
+	"github.com/klauspost/compress/zstd"
 	"github.com/buildbarn/bb-storage/pkg/capabilities"
 	"github.com/buildbarn/bb-storage/pkg/cloud/aws"
 	"github.com/buildbarn/bb-storage/pkg/cloud/gcp"
@@ -93,10 +94,24 @@ func (bac *casBlobAccessCreator) NewCustomBlobAccess(terminationGroup program.Gr
 		if err != nil {
 			return BlobAccessInfo{}, "", err
 		}
+		var zstdPool *grpcclients.BoundedZstdPool
+		if backend.Grpc.EnableCompression {
+			zstdPool = grpcclients.NewBoundedZstdPool(
+				16, 32,
+				[]zstd.EOption{
+					zstd.WithEncoderConcurrency(1),
+					zstd.WithWindowSize(4 << 20),
+				},
+				[]zstd.DOption{
+					zstd.WithDecoderConcurrency(1),
+					zstd.WithDecoderMaxWindow(8 << 20),
+				},
+			)
+		}
 		// TODO: Should we provide a configuration option, so
 		// that digest.KeyWithoutInstance can be used?
 		return BlobAccessInfo{
-			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 64<<10, backend.Grpc.EnableCompression),
+			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 64<<10, backend.Grpc.EnableCompression, zstdPool),
 			DigestKeyFormat: digest.KeyWithInstance,
 		}, "grpc", nil
 	case *pb.BlobAccessConfiguration_ReferenceExpanding:

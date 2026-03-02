@@ -23,36 +23,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// DefaultZstdPool is a shared pool for ZSTD encoders/decoders.
-// It is initialized with default settings on first use.
-// This can be overridden via SetDefaultZstdPool for custom configurations.
-var (
-	defaultZstdPool     *BoundedZstdPool
-	defaultZstdPoolOnce sync.Once
-)
-
-// GetDefaultZstdPool returns the shared ZSTD pool, initializing it if needed.
-func GetDefaultZstdPool() *BoundedZstdPool {
-	defaultZstdPoolOnce.Do(func() {
-		defaultZstdPool = DefaultZstdPoolConfig().NewPool()
-	})
-	return defaultZstdPool
-}
-
-// SetDefaultZstdPool allows overriding the default pool before first use.
-// This should be called during initialization, before any CAS operations.
-// It panics if called after the pool has already been initialized.
-func SetDefaultZstdPool(pool *BoundedZstdPool) {
-	alreadyInit := true
-	defaultZstdPoolOnce.Do(func() {
-		defaultZstdPool = pool
-		alreadyInit = false
-	})
-	if alreadyInit {
-		panic("SetDefaultZstdPool called after pool was already initialized")
-	}
-}
-
 type casBlobAccess struct {
 	byteStreamClient                bytestream.ByteStreamClient
 	contentAddressableStorageClient remoteexecution.ContentAddressableStorageClient
@@ -71,17 +41,9 @@ type casBlobAccess struct {
 // Addressable Storage.
 //
 // If enableZSTDCompression is true, the client will use ZSTD compression
-// for ByteStream operations if the server supports it.
-func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int, enableZSTDCompression bool) blobstore.BlobAccess {
-	return NewCASBlobAccessWithPool(client, uuidGenerator, readChunkSize, enableZSTDCompression, nil)
-}
-
-// NewCASBlobAccessWithPool creates a BlobAccess handle with a custom ZSTD pool.
-// If pool is nil, the default shared pool will be used.
-func NewCASBlobAccessWithPool(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int, enableZSTDCompression bool, pool *BoundedZstdPool) blobstore.BlobAccess {
-	if pool == nil {
-		pool = GetDefaultZstdPool()
-	}
+// for ByteStream operations if the server supports it. In that case,
+// zstdPool must be provided for pooling encoders/decoders.
+func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int, enableZSTDCompression bool, zstdPool *BoundedZstdPool) blobstore.BlobAccess {
 	return &casBlobAccess{
 		byteStreamClient:                bytestream.NewByteStreamClient(client),
 		contentAddressableStorageClient: remoteexecution.NewContentAddressableStorageClient(client),
@@ -89,7 +51,7 @@ func NewCASBlobAccessWithPool(client grpc.ClientConnInterface, uuidGenerator uti
 		uuidGenerator:                   uuidGenerator,
 		readChunkSize:                   readChunkSize,
 		enableZSTDCompression:           enableZSTDCompression,
-		zstdPool:                        pool,
+		zstdPool:                        zstdPool,
 	}
 }
 

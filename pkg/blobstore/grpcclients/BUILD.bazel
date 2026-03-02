@@ -8,7 +8,6 @@ go_library(
         "fsac_blob_access.go",
         "icas_blob_access.go",
         "iscc_blob_access.go",
-        "zstd_config.go",
         "zstd_pool.go",
     ],
     importpath = "github.com/buildbarn/bb-storage/pkg/blobstore/grpcclients",

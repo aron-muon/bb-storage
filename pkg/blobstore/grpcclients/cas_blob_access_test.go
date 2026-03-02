@@ -28,12 +28,20 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
+func newTestZstdPool(maxEncoders, maxDecoders int64) *grpcclients.BoundedZstdPool {
+	return grpcclients.NewBoundedZstdPool(
+		maxEncoders, maxDecoders,
+		[]zstd.EOption{zstd.WithEncoderConcurrency(1)},
+		[]zstd.DOption{zstd.WithDecoderConcurrency(1)},
+	)
+}
+
 func TestCASBlobAccessPut(t *testing.T) {
 	ctrl, ctx := gomock.WithContext(context.Background(), t)
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, false)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, false, nil)
 
 	blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
 	uuid := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
@@ -171,7 +179,7 @@ func TestCASBlobAccessGet(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, false)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, false, nil)
 
 	t.Run("Success", func(t *testing.T) {
 		blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
@@ -272,7 +280,7 @@ func TestCASBlobAccessGetCapabilities(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, false)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, false, nil)
 
 	t.Run("BackendFailure", func(t *testing.T) {
 		client.EXPECT().Invoke(
@@ -373,7 +381,7 @@ func TestCASBlobAccessPutWithCompression(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, true)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, true, newTestZstdPool(16, 16))
 
 	expectGetCapabilitiesWithZSTD(client)
 
@@ -451,7 +459,7 @@ func TestCASBlobAccessGetWithCompression(t *testing.T) {
 
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 100, true)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 100, true, newTestZstdPool(16, 16))
 
 	expectGetCapabilitiesWithZSTD(client)
 
@@ -499,7 +507,7 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	ctrl, ctx := gomock.WithContext(context.Background(), t)
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccessWithPool(client, uuidGenerator.Call, 10, true, pool)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, true, pool)
 
 	expectGetCapabilitiesWithZSTD(client)
 
@@ -579,7 +587,7 @@ func TestCASBlobAccessPutPoolReleasesEncoder(t *testing.T) {
 	ctrl, ctx := gomock.WithContext(context.Background(), t)
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccessWithPool(client, uuidGenerator.Call, 10, true, pool)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 10, true, pool)
 
 	expectGetCapabilitiesWithZSTD(client)
 
@@ -619,7 +627,7 @@ func TestCASBlobAccessGetPoolReleasesDecoder(t *testing.T) {
 	ctrl, ctx := gomock.WithContext(context.Background(), t)
 	client := mock.NewMockClientConnInterface(ctrl)
 	uuidGenerator := mock.NewMockUUIDGenerator(ctrl)
-	blobAccess := grpcclients.NewCASBlobAccessWithPool(client, uuidGenerator.Call, 100, true, pool)
+	blobAccess := grpcclients.NewCASBlobAccess(client, uuidGenerator.Call, 100, true, pool)
 
 	expectGetCapabilitiesWithZSTD(client)
 
