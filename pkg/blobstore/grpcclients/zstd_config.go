@@ -122,8 +122,8 @@ func ConfigFromMemoryBudget(memoryBudgetBytes int64) ZstdPoolConfig {
 	encoderBudget := memoryBudgetBytes * 30 / 100
 	decoderBudget := memoryBudgetBytes * 70 / 100
 
-	config.MaxConcurrentEncoders = max64(1, encoderBudget/DefaultEncoderMemoryBytes)
-	config.MaxConcurrentDecoders = max64(1, decoderBudget/DefaultDecoderMemoryBytes)
+	config.MaxConcurrentEncoders = max(1, encoderBudget/DefaultEncoderMemoryBytes)
+	config.MaxConcurrentDecoders = max(1, decoderBudget/DefaultDecoderMemoryBytes)
 
 	return config
 }
@@ -144,11 +144,4 @@ func ParseEncoderLevel(level string) zstd.EncoderLevel {
 	default:
 		return zstd.SpeedDefault
 	}
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

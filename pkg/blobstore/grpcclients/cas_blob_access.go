@@ -43,8 +43,7 @@ func GetDefaultZstdPool() *BoundedZstdPool {
 // This should be called during initialization, before any CAS operations.
 // It panics if called after the pool has already been initialized.
 func SetDefaultZstdPool(pool *BoundedZstdPool) {
-	// Check if already initialized
-	var alreadyInit bool
+	alreadyInit := true
 	defaultZstdPoolOnce.Do(func() {
 		defaultZstdPool = pool
 		alreadyInit = false
@@ -164,7 +163,11 @@ func (r *zstdByteStreamChunkReader) init(ctx context.Context) error {
 }
 
 func (r *zstdByteStreamChunkReader) Read() ([]byte, error) {
-	// Lazy initialization on first read - allows context to be passed
+	// Lazy initialization on first read. We use context.Background() here
+	// because the buffer.ChunkReader interface does not propagate a context.
+	// This means decoder pool acquisition on the read path cannot be
+	// cancelled by the original request context. The pool's semaphore will
+	// still bound concurrency; the caller can cancel by closing the reader.
 	if err := r.init(context.Background()); err != nil {
 		return nil, err
 	}

@@ -3,12 +3,14 @@ package grpcclients_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/buildbarn/bb-storage/pkg/blobstore/grpcclients"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 )
 
@@ -202,7 +204,7 @@ func TestBoundedZstdPool_ConcurrentAccess(t *testing.T) {
 				return
 			}
 			if !bytes.Equal(result, testData) {
-				errors <- err
+				errors <- fmt.Errorf("decompressed data mismatch: got %d bytes, want %d bytes", len(result), len(testData))
 				return
 			}
 		}()
@@ -305,6 +307,17 @@ func TestZstdPoolConfigNewPool(t *testing.T) {
 	pool.ReleaseEncoder(enc)
 }
 
+func TestSetDefaultZstdPoolAfterInitPanics(t *testing.T) {
+	// GetDefaultZstdPool initializes the global pool via sync.Once.
+	// A subsequent SetDefaultZstdPool must panic because the pool is
+	// already initialized and cannot be replaced.
+	_ = grpcclients.GetDefaultZstdPool()
+
+	require.Panics(t, func() {
+		grpcclients.SetDefaultZstdPool(grpcclients.NewBoundedZstdPool(1, 1, nil, nil))
+	})
+}
+
 func BenchmarkBoundedZstdPool_AcquireRelease(b *testing.B) {
 	pool := grpcclients.NewBoundedZstdPool(16, 16, nil, nil)
 	testData := bytes.Repeat([]byte("benchmark data "), 1000)
@@ -328,8 +341,7 @@ func BenchmarkZstdNoPool(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			var buf bytes.Buffer
-			// This is what Tyler's current code does - new encoder per operation
-			enc, _ := grpcclients.NewBoundedZstdPool(1, 1, nil, nil).AcquireEncoder(context.Background(), &buf)
+			enc, _ := zstd.NewWriter(&buf, zstd.WithEncoderConcurrency(1))
 			enc.Write(testData)
 			enc.Close()
 		}
