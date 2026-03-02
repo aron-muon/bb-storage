@@ -71,7 +71,7 @@ def container_push_official(name, image, component):
         name = name,
         image = image,
         registry = "ghcr.io",
-        repository = "buildbarn/" + component,
+        repository = "aron-muon/" + component,
         tag_file = "@com_github_buildbarn_bb_storage//tools:stamped_tags",
         # Don't build container image unless explicitly requested, as
         # building all variants can be time-consuming.
