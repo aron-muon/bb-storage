@@ -931,9 +931,48 @@ message GrpcBlobAccessConfiguration {
   // Base gRPC client configuration.
   buildbarn.configuration.grpc.ClientConfiguration client = 1;
 
-  // Enable ZSTD compression for ByteStream operations in the Content
-  // Addressable Storage (CAS). When enabled, ZSTD compression will be
-  // used if the server supports it. Has no effect for other storage
-  // types (AC, ICAS, etc.).
-  bool enable_compression = 2;
+  // Optional ZSTD compression configuration for ByteStream operations
+  // in the Content Addressable Storage (CAS). When set, ZSTD
+  // compression will be used if the server supports it. Has no effect
+  // for other storage types (AC, ICAS, etc.).
+  //
+  // If not set, compression is disabled and no encoder/decoder pools
+  // are allocated.
+  ZstdCompressionConfiguration zstd = 3;
+
+  reserved 2;
+}
+
+message ZstdCompressionConfiguration {
+  // Maximum number of concurrent ZSTD encoding operations. Each
+  // encoder allocates memory proportional to the configured window
+  // size. When all encoder slots are in use, new Put operations will
+  // block until a slot becomes available, providing backpressure.
+  int64 max_encoders = 1;
+
+  // Maximum number of concurrent ZSTD decoding operations. Each
+  // decoder allocates memory proportional to the configured maximum
+  // window size. When all decoder slots are in use, new Get operations
+  // will block until a slot becomes available, providing backpressure.
+  int64 max_decoders = 2;
+
+  // Window size used by ZSTD encoders, in bytes. Larger windows
+  // improve compression ratio at the cost of memory per encoder.
+  // Total encoder memory budget is approximately
+  // max_encoders * encoder_window_size_bytes.
+  int32 encoder_window_size_bytes = 3;
+
+  // Maximum window size accepted by ZSTD decoders, in bytes. Streams
+  // compressed with a larger window than this will be rejected. Total
+  // decoder memory budget is approximately
+  // max_decoders * decoder_max_window_size_bytes.
+  int32 decoder_max_window_size_bytes = 4;
+
+  // Compression level for ZSTD encoders. If not set, the default
+  // level from the zstd library is used.
+  //
+  // Higher levels achieve better compression ratios at the cost of
+  // CPU time. The zstd library supports levels from 1 (fastest) to
+  // 19 (best compression), with a default of 3.
+  int32 encoder_level = 5;
 }
