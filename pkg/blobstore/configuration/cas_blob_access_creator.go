@@ -94,24 +94,31 @@ func (bac *casBlobAccessCreator) NewCustomBlobAccess(terminationGroup program.Gr
 		if err != nil {
 			return BlobAccessInfo{}, "", err
 		}
+		enableCompression := false
 		var zstdPool *grpcclients.BoundedZstdPool
-		if backend.Grpc.EnableCompression {
+		if zstdConfig := backend.Grpc.Zstd; zstdConfig != nil {
+			enableCompression = true
+			encoderOptions := []zstd.EOption{
+				zstd.WithEncoderConcurrency(1),
+				zstd.WithWindowSize(int(zstdConfig.EncoderWindowSizeBytes)),
+			}
+			if zstdConfig.EncoderLevel != 0 {
+				encoderOptions = append(encoderOptions, zstd.WithEncoderLevel(zstd.EncoderLevel(zstdConfig.EncoderLevel)))
+			}
 			zstdPool = grpcclients.NewBoundedZstdPool(
-				16, 32,
-				[]zstd.EOption{
-					zstd.WithEncoderConcurrency(1),
-					zstd.WithWindowSize(4 << 20),
-				},
+				zstdConfig.MaxEncoders,
+				zstdConfig.MaxDecoders,
+				encoderOptions,
 				[]zstd.DOption{
 					zstd.WithDecoderConcurrency(1),
-					zstd.WithDecoderMaxWindow(8 << 20),
+					zstd.WithDecoderMaxWindow(uint64(zstdConfig.DecoderMaxWindowSizeBytes)),
 				},
 			)
 		}
 		// TODO: Should we provide a configuration option, so
 		// that digest.KeyWithoutInstance can be used?
 		return BlobAccessInfo{
-			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 64<<10, backend.Grpc.EnableCompression, zstdPool),
+			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 64<<10, enableCompression, zstdPool),
 			DigestKeyFormat: digest.KeyWithInstance,
 		}, "grpc", nil
 	case *pb.BlobAccessConfiguration_ReferenceExpanding:
