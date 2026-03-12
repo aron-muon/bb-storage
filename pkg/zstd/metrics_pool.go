@@ -123,15 +123,14 @@ func (p *metricsPool) NewDecoder(ctx context.Context, r io.Reader) (Decoder, err
 type metricsEncoder struct {
 	Encoder
 	releases prometheus.Counter
-	closed   bool
 }
 
 func (e *metricsEncoder) Close() error {
-	if e.closed {
+	if e.Encoder == nil {
 		return nil
 	}
-	e.closed = true
 	err := e.Encoder.Close()
+	e.Encoder = nil
 	e.releases.Inc()
 	return err
 }
@@ -139,14 +138,13 @@ func (e *metricsEncoder) Close() error {
 type metricsDecoder struct {
 	Decoder
 	releases prometheus.Counter
-	closed   bool
 }
 
 func (d *metricsDecoder) Close() {
-	if d.closed {
+	if d.Decoder == nil {
 		return
 	}
-	d.closed = true
 	d.Decoder.Close()
+	d.Decoder = nil
 	d.releases.Inc()
 }
