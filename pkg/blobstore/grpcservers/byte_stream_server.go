@@ -222,7 +222,6 @@ func (s *byteStreamServer) writeZstd(stream bytestream.ByteStream_WriteServer, r
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD decoder: %v", err)
 	}
-	defer zstdReader.Close()
 
 	if err := s.blobAccess.Put(
 		ctx,
