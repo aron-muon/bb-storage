@@ -9,6 +9,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/digest"
+	"github.com/buildbarn/bb-storage/pkg/util"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 
 	"google.golang.org/genproto/googleapis/bytestream"
@@ -220,7 +221,7 @@ func (s *byteStreamServer) writeZstd(stream bytestream.ByteStream_WriteServer, r
 
 	zstdReader, err := bb_zstd.NewReadCloser(ctx, s.zstdPool, streamReader)
 	if err != nil {
-		return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD decoder: %v", err)
+		return util.StatusWrap(err, "Failed to acquire ZSTD decoder")
 	}
 
 	if err := s.blobAccess.Put(
