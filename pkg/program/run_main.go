@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
-	"time"
 )
 
 // runMainErrorLogger is used by RunMain() to capture errors returned by
@@ -34,53 +33,40 @@ func (el *runMainErrorLogger) startShutdown(shutdownFunc func()) {
 	})
 }
 
-// terminateWithSignal terminates the current process by sending a
-// signal to itself.
+// terminateWithSignal terminates the current process after a graceful
+// shutdown initiated by `terminationSignal`. The previous implementation
+// raised the same signal back to the process via signal.Reset() +
+// process.Signal() so the container/init system would observe a
+// signal-style exit (e.g. 128+SIGTERM=143). Two issues with that:
+//
+//  1. signal.Reset() only disables Go's user-channel routing for the
+//     signal — it does NOT restore SIG_DFL. The runtime's signal
+//     trampoline is still installed and intercepts the raised signal,
+//     dispatching it to runtime.dieFromSignal().
+//
+//  2. runtime.dieFromSignal() (runtime/signal_unix.go) attempts to die
+//     from the signal via raise(sig) -> osyield x3 -> setsig(SIG_DFL) +
+//     raise(sig) -> osyield x3, then falls through to a hard
+//     `exit(2)`. PID 1 in a PID namespace and multi-goroutine programs
+//     reliably hit that fall-through, surfacing a spurious exit 2 to
+//     k8s/systemd despite a clean shutdown. The earlier
+//     `time.Sleep + os.Exit()` fallback in this function never got a
+//     chance to run because the runtime exited first.
+//
+// More background:
+//   - https://github.com/golang/go/issues/19326
+//   - https://github.com/golang/go/issues/46321
+//
+// We initiated this shutdown intentionally (caller signal or routines
+// finishing cleanly), so just exit 0 directly. terminationSignal is
+// retained in the signature for API stability and is intentionally
+// unused.
 func terminateWithSignal(currentPID int, terminationSignal os.Signal) {
+	_ = currentPID
+	_ = terminationSignal
 	if runtime.GOOS == "windows" {
-		// On Windows, process.Signal() is not supported so
-		// immediately exit.
 		os.Exit(1)
 	}
-
-	// Clear the signal handler and raise the
-	// original signal once again. That way we shut
-	// down under the original circumstances.
-	signal.Reset(terminationSignal)
-	process, err := os.FindProcess(currentPID)
-	if err != nil {
-		panic(err)
-	}
-	if err := process.Signal(terminationSignal); err != nil {
-		panic(err)
-	}
-
-	// This code should not be reached, if it weren't for the fact
-	// that process.Signal() does not guarantee that the signal is
-	// delivered to the same thread.
-	//
-	// Furthermore, signal.Reset() does not reset signals that are
-	// delivered via the process group, but ignored by the process
-	// itself. Fall back to calling os.Exit() if we don't get
-	// terminated via signal delivery.
-	//
-	// More details:
-	// https://github.com/golang/go/issues/19326
-	// https://github.com/golang/go/issues/46321
-	//
-	// Give the kernel a moment to deliver the signal we just raised
-	// before falling through. The previous duration of `5` evaluated to
-	// time.Duration(5) which is 5 nanoseconds — effectively no wait, so
-	// the fallback fired on every shutdown. A second is plenty of slack
-	// for signal delivery on a healthy host while still being a tight
-	// upper bound for a process that already finished its routines.
-	time.Sleep(time.Second)
-
-	// Reaching here means signal delivery raced and we were not
-	// terminated by the signal. We still initiated this shutdown
-	// intentionally (either by an explicit signal from the caller or
-	// because all routines finished cleanly), so exit 0 to surface a
-	// successful termination rather than a spurious failure.
 	os.Exit(0)
 }
 
