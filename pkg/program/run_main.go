@@ -67,8 +67,21 @@ func terminateWithSignal(currentPID int, terminationSignal os.Signal) {
 	// More details:
 	// https://github.com/golang/go/issues/19326
 	// https://github.com/golang/go/issues/46321
-	time.Sleep(5)
-	os.Exit(1)
+	//
+	// Give the kernel a moment to deliver the signal we just raised
+	// before falling through. The previous duration of `5` evaluated to
+	// time.Duration(5) which is 5 nanoseconds — effectively no wait, so
+	// the fallback fired on every shutdown. A second is plenty of slack
+	// for signal delivery on a healthy host while still being a tight
+	// upper bound for a process that already finished its routines.
+	time.Sleep(time.Second)
+
+	// Reaching here means signal delivery raced and we were not
+	// terminated by the signal. We still initiated this shutdown
+	// intentionally (either by an explicit signal from the caller or
+	// because all routines finished cleanly), so exit 0 to surface a
+	// successful termination rather than a spurious failure.
+	os.Exit(0)
 }
 
 var terminationSignals = []os.Signal{
