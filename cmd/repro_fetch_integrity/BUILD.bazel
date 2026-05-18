@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "repro_fetch_integrity_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/buildbarn/bb-storage/cmd/repro_fetch_integrity",
+    visibility = ["//visibility:private"],
+    deps = [
+        "@com_github_klauspost_compress//zstd",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//metadata",
+    ],
+)
+
+go_binary(
+    name = "repro_fetch_integrity",
+    embed = [":repro_fetch_integrity_lib"],
+    pure = "on",
+    visibility = ["//visibility:public"],
+)
