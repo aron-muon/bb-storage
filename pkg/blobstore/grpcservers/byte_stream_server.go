@@ -230,8 +230,29 @@ func (s *byteStreamServer) writeZstd(stream bytestream.ByteStream_WriteServer, r
 		buffer.NewCASBufferFromReader(digest, zstdReader, buffer.UserProvided)); err != nil {
 		return err
 	}
+	// Determine the CommittedSize to report for this compressed (ZSTD) write.
+	//
+	// Normal case: Put() drained the entire inbound stream, so the final
+	// WriteRequest (FinishWrite=true) was read and streamReader.finished is
+	// true; nextOffset is then the total number of compressed bytes the client
+	// sent, which is what the client expects back.
+	//
+	// Deduplication case: when the blob is already present, the backend
+	// (bazel-remote) detects the duplicate, returns a successful WriteResponse
+	// and half-closes its end of the stream BEFORE we finish draining the
+	// client's compressed input (see casBlobAccess early-close handling). Put()
+	// then returns nil with streamReader.finished == false and nextOffset stuck
+	// at a partial, chunk-aligned value. Reporting that partial offset violates
+	// the REAPI compressed-blobs contract — Bazel's checkCommittedSize requires
+	// a compressed Write to report either the full committed size or -1 for an
+	// already-present blob, and rejects anything else with
+	// "committed_size N is neither -1 nor total M". Report the -1 sentinel.
+	committedSize := streamReader.nextOffset
+	if !streamReader.finished {
+		committedSize = -1
+	}
 	return stream.SendAndClose(&bytestream.WriteResponse{
-		CommittedSize: streamReader.nextOffset,
+		CommittedSize: committedSize,
 	})
 }
 
